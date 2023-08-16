@@ -952,7 +952,6 @@ class LoRANetwork(torch.nn.Module):
     def is_mergeable(self):
         return True
 
-    # TODO refactor to common function with apply_to
     def merge_to(self, text_encoder, unet, weights_sd, dtype, device):
         apply_text_encoder = apply_unet = False
         for key in weights_sd.keys():

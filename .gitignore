@@ -45,3 +45,18 @@ requirements_tmp_for_setup.txt
 
 *.npz
 presets/*/user_presets/*
+cache_dir
+demo
+exp_came_comp
+fine_tuned_xl_base_3m
+fine_tuned_xl_base_3m_lower_lr
+finetuen_laion_3m
+hires_cache_dir
+lineart_models
+samples_xl_finetune
+T2Iadapter_lineart
+*.sh
+prompts_file.txt
+prompts_list4test.txt
+*.jpg
+*.png

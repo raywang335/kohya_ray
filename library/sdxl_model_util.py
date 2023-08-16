@@ -4,6 +4,7 @@ from transformers import CLIPTextModel, CLIPTextConfig, CLIPTextModelWithProject
 from diffusers import AutoencoderKL
 from library import model_util
 from library import sdxl_original_unet
+from library import sdxl_t2i_adapter
 
 
 VAE_SCALE_FACTOR = 0.13025
@@ -81,8 +82,7 @@ def convert_sdxl_text_encoder_2_checkpoint(checkpoint, max_length):
 
     return new_sd, logit_scale
 
-
-def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
+def load_adapters_from_sdxl_checkpoint(model_version, ckpt_path, map_location, isfull=False):
     # model_version is reserved for future use
 
     # Load the state dict
@@ -104,17 +104,57 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
         checkpoint = None
 
     # U-Net
-    print("building U-Net")
-    unet = sdxl_original_unet.SdxlUNet2DConditionModel()
+    print("building SDXL-adapter")
+    adapter = sdxl_t2i_adapter.SdxlT2IAdapter(sk=True, use_conv=False) if not isfull else sdxl_t2i_adapter.SdxlT2IAdapterFull()
 
-    print("loading U-Net from checkpoint")
-    unet_sd = {}
+    print("loading SDXL-adapter from checkpoint")
+    adapter_sd = {}
     for k in list(state_dict.keys()):
-        if k.startswith("model.diffusion_model."):
-            unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
-    info = unet.load_state_dict(unet_sd)
-    print("U-Net: ", info)
-    del unet_sd
+        if k.startswith("model.sdxl_adapter."):
+            adapter_sd[k.replace("model.sdxl_adapter.", "")] = state_dict.pop(k)
+    info = adapter.load_state_dict(adapter_sd)
+    del adapter_sd
+
+    ckpt_info = (epoch, global_step) if epoch is not None else None
+    return adapter, ckpt_info
+
+
+def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, need_unet=True):
+    # model_version is reserved for future use
+
+    # Load the state dict
+    if model_util.is_safetensors(ckpt_path):
+        checkpoint = None
+        state_dict = load_file(ckpt_path, device=map_location)
+        epoch = None
+        global_step = None
+    else:
+        checkpoint = torch.load(ckpt_path, map_location=map_location)
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+            epoch = checkpoint.get("epoch", 0)
+            global_step = checkpoint.get("global_step", 0)
+        else:
+            state_dict = checkpoint
+            epoch = 0
+            global_step = 0
+        checkpoint = None
+
+    # U-Net
+    if need_unet:
+        print("building U-Net")
+        unet = sdxl_original_unet.SdxlUNet2DConditionModel()
+
+        print("loading U-Net from checkpoint")
+        unet_sd = {}
+        for k in list(state_dict.keys()):
+            if k.startswith("model.diffusion_model."):
+                unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
+        info = unet.load_state_dict(unet_sd)
+        print("U-Net: ", info)
+        del unet_sd
+    else: 
+        unet = None
 
     # Text Encoders
     print("building text encoders")
@@ -295,6 +335,47 @@ def save_stable_diffusion_checkpoint(
     # Convert the VAE
     vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
     update_sd("first_stage_model.", vae_dict)
+
+    # Put together new checkpoint
+    key_count = len(state_dict.keys())
+    new_ckpt = {"state_dict": state_dict}
+
+    # epoch and global_step are sometimes not int
+    if ckpt_info is not None:
+        epochs += ckpt_info[0]
+        steps += ckpt_info[1]
+
+    new_ckpt["epoch"] = epochs
+    new_ckpt["global_step"] = steps
+
+    if model_util.is_safetensors(output_file):
+        save_file(state_dict, output_file)
+    else:
+        torch.save(new_ckpt, output_file)
+
+    return key_count
+
+
+def save_sdxl_adapter_checkpoint(
+    output_file,
+    sdxl_adapter,
+    epochs,
+    steps,
+    ckpt_info,
+    save_dtype=None,
+    
+):
+    state_dict = {}
+
+    def update_sd(prefix, sd):
+        for k, v in sd.items():
+            key = prefix + k
+            if save_dtype is not None:
+                v = v.detach().clone().to("cpu").to(save_dtype)
+            state_dict[key] = v
+
+    # Convert the UNet model
+    update_sd("model.sdxl_adapter.", sdxl_adapter.state_dict())
 
     # Put together new checkpoint
     key_count = len(state_dict.keys())

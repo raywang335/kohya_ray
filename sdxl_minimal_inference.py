@@ -78,7 +78,7 @@ if __name__ == "__main__":
 
     steps = 50
     guidance_scale = 7
-    seed = None  # 1
+    
 
     DEVICE = "cuda"
     DTYPE = torch.float16  # bfloat16 may work
@@ -96,12 +96,15 @@ if __name__ == "__main__":
         help="LoRA weights, only supports networks.lora, each arguement is a `path;multiplier` (semi-colon separated)",
     )
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--batchsize", type=int, default=1)
+    parser.add_argument("--gen_number", type=int, default=1)
+    parser.add_argument("--input_file", type=str, default=None)
     args = parser.parse_args()
-
     # HuggingFaceのmodel id
     text_encoder_1_name = "openai/clip-vit-large-patch14"
     text_encoder_2_name = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
-
+    seed = args.seed  # 1
     # checkpointを読み込む。モデル変換についてはそちらの関数を参照
     # Load checkpoint. For model conversion, see this function
 
@@ -169,7 +172,7 @@ if __name__ == "__main__":
         beta_schedule=SCHEDLER_SCHEDULE,
     )
 
-    def generate_image(prompt, negative_prompt, seed=None):
+    def generate_image(prompt, negative_prompt, seed=None, model_name=None):
         # 将来的にサイズ情報も変えられるようにする / Make it possible to change the size information in the future
         # prepare embedding
         with torch.no_grad():
@@ -182,7 +185,6 @@ if __name__ == "__main__":
             uc_vector = c_vector.clone().to(DEVICE, dtype=DTYPE)  # ちょっとここ正しいかどうかわからない I'm not sure if this is right
 
             # crossattn
-
         # Text Encoderを二つ呼ぶ関数  Function to call two Text Encoders
         def call_text_encoder(text):
             # text encoder 1
@@ -215,13 +217,18 @@ if __name__ == "__main__":
             return text_embedding, text_embedding2_pool
 
         # cond
+        prompt = [prompt for _ in range(args.batchsize)]
+        negative_prompt = [negative_prompt for _ in range(args.batchsize)]
         c_ctx, c_ctx_pool = call_text_encoder(prompt)
-        # print(c_ctx.shape, c_ctx_p.shape, c_vector.shape)
-        c_vector = torch.cat([c_ctx_pool, c_vector], dim=1)
+        # print(c_ctx.shape, c_ctx_pool.shape, c_vector.shape)
+        if args.batchsize > 1:
+            c_vector = c_vector.repeat(args.batchsize, 1)
+            uc_vector = uc_vector.repeat(args.batchsize, 1)
+        c_vector = torch.cat([c_ctx_pool, c_vector], dim=-1)
 
         # uncond
         uc_ctx, uc_ctx_pool = call_text_encoder(negative_prompt)
-        uc_vector = torch.cat([uc_ctx_pool, uc_vector], dim=1)
+        uc_vector = torch.cat([uc_ctx_pool, uc_vector], dim=-1)
 
         text_embeddings = torch.cat([uc_ctx, c_ctx])
         vector_embeddings = torch.cat([uc_vector, c_vector])
@@ -243,7 +250,7 @@ if __name__ == "__main__":
         # get the initial random noise unless the user supplied it
         # SDXLはCPUでlatentsを作成しているので一応合わせておく、Diffusersはtarget deviceでlatentsを作成している
         # SDXL creates latents in CPU, Diffusers creates latents in target device
-        latents_shape = (1, 4, target_height // 8, target_width // 8)
+        latents_shape = (args.batchsize, 4, target_height // 8, target_width // 8)
         latents = torch.randn(
             latents_shape,
             generator=generator,
@@ -292,10 +299,18 @@ if __name__ == "__main__":
         # 保存して終了 save and finish
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         for i, img in enumerate(image):
-            img.save(os.path.join(args.output_dir, f"image_{timestamp}_{i:03d}.png"))
+            if model_name is not None:
+                img.save(os.path.join(args.output_dir, f"{model_name}_{seed}_image_{timestamp}_{i:03d}.png"))
+            else:
+                img.save(os.path.join(args.output_dir, f"{seed}_image_{timestamp}_{i:03d}.png"))
 
     if not args.interactive:
-        generate_image(args.prompt, args.negative_prompt, seed)
+        for i in tqdm(range(args.gen_number)):
+            seed = None if args.seed is None else args.seed + i
+            if args.input_file is not None:
+                prompts_list = open(args.input_file).readlines()
+                for prompt in prompts_list:
+                    generate_image(prompt.strip(), args.negative_prompt, seed, os.path.basename(args.ckpt_path))
     else:
         # loop for interactive
         while True:

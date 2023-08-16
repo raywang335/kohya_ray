@@ -31,7 +31,6 @@ from library.custom_train_functions import (
 )
 
 
-# TODO 他のスクリプトと共通化する
 def generate_step_logs(args: argparse.Namespace, current_loss, avr_loss, lr_scheduler):
     logs = {
         "loss/current": current_loss,
@@ -121,6 +120,7 @@ def train(args):
     )
 
     # DiffusersのControlNetが使用するデータを準備する
+    # TODO: Change the default config of SD1.5 into XL0.9
     if args.v2:
         unet.config = {
             "act_fn": "silu",
@@ -297,7 +297,6 @@ def train(args):
         args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
     # 学習する
-    # TODO: find a way to handle total batch size when there are multiple datasets
     accelerator.print("running training / 学習開始")
     accelerator.print(f"  num train images * repeats / 学習画像の数×繰り返し回数: {train_dataset_group.num_train_images}")
     accelerator.print(f"  num reg images / 正則化画像の数: {train_dataset_group.num_reg_images}")

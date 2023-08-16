@@ -10,6 +10,7 @@ from transformers import CLIPTokenizer
 import open_clip
 from library import model_util, sdxl_model_util, train_util
 from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeightingPipeline
+import numpy as np
 
 TOKENIZER_PATH = "openai/clip-vit-large-patch14"
 
@@ -48,6 +49,27 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
 
     return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
 
+# TODO: Load xl-adapters
+def load_xl_model(args, accelerator, model_version: str, weight_dtype, isfull=False):
+    # load models for each process
+    for pi in range(accelerator.state.num_processes):
+        if pi == accelerator.state.local_process_index:
+            print(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
+
+            (
+                load_stable_diffusion_format,
+                sd_adapter,
+                ckpt_info,
+            ) = _load_adapter_model(args, model_version, weight_dtype, accelerator.device if args.lowram else "cpu", isfull=isfull)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+        accelerator.wait_for_everyone()
+
+    sd_adapter = train_util.transform_models_if_DDP([sd_adapter])
+
+    return load_stable_diffusion_format, sd_adapter, ckpt_info
+
 
 def _load_target_model(args: argparse.Namespace, model_version: str, weight_dtype, device="cpu"):
     # only supports StableDiffusion
@@ -75,6 +97,24 @@ def _load_target_model(args: argparse.Namespace, model_version: str, weight_dtyp
 
     return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
 
+
+def _load_adapter_model(args: argparse.Namespace, model_version: str, weight_dtype, device="cpu", isfull=False):
+    # only supports StableDiffusion
+    name_or_path = args.adapter_resume_path
+    assert os.path.exists(args.name_or_path), f"checkpoint not found: {name_or_path}"
+    name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
+    load_stable_diffusion_format = os.path.isfile(name_or_path)  # determine SD or Diffusers
+    assert (
+        load_stable_diffusion_format
+    ), f"only supports StableDiffusion format for SDXL / SDXLではStableDiffusion形式のみサポートしています: {name_or_path}"
+
+    print(f"load StableDiffusion checkpoint: {name_or_path}")
+    (
+        sd_adapter,
+        ckpt_info,
+    ) = sdxl_model_util.load_adapters_from_sdxl_checkpoint(model_version, name_or_path, device, isfull=isfull)
+
+    return load_stable_diffusion_format, sd_adapter, ckpt_info
 
 class WrapperTokenizer:
     # open clipのtokenizerをHuggingFaceのtokenizerと同じ形で使えるようにする
@@ -353,12 +393,55 @@ def save_sd_model_on_epoch_end_or_stepwise(
         diffusers_saver,
     )
 
+def save_sd_adapter_on_epoch_end_or_stepwise(
+    args: argparse.Namespace,
+    on_epoch_end: bool,
+    accelerator,
+    src_path,
+    save_stable_diffusion_format: bool,
+    use_safetensors: bool,
+    save_dtype: torch.dtype,
+    epoch: int,
+    num_train_epochs: int,
+    global_step: int,
+    sd_xl_adapter, 
+    ckpt_info,
+):
+    def sd_saver(ckpt_file, epoch_no, global_step):
+        sdxl_model_util.save_sdxl_adapter_checkpoint(
+            ckpt_file,
+            sd_xl_adapter,
+            epoch_no,
+            global_step,
+            ckpt_info,
+            save_dtype,
+        )
+
+    def diffusers_saver(out_dir):
+        raise NotImplementedError("diffusers_saver is not implemented")
+
+    train_util.save_sd_model_on_epoch_end_or_stepwise_common(
+        args,
+        on_epoch_end,
+        accelerator,
+        save_stable_diffusion_format,
+        use_safetensors,
+        epoch,
+        num_train_epochs,
+        global_step,
+        sd_saver,
+        diffusers_saver,
+    )
+
 
 # TextEncoderの出力をキャッシュする
 # weight_dtypeを指定するとText Encoderそのもの、およひ出力がweight_dtypeになる
-def cache_text_encoder_outputs(args, accelerator, tokenizers, text_encoders, dataset, weight_dtype):
+def cache_text_encoder_outputs(args, accelerator, tokenizers, text_encoders, dataset, weight_dtype, text_encoder_cache_dir):
     print("caching text encoder outputs")
-
+    if text_encoder_cache_dir is not None and os.path.exists(os.path.join(text_encoder_cache_dir, "text_enc1.npy")):
+        text_encoder1_cache = np.load(os.path.join(text_encoder_cache_dir, "text_enc1.npy"), allow_pickle=True).item()
+        text_encoder2_cache = np.load(os.path.join(text_encoder_cache_dir, "text_enc2.npy"), allow_pickle=True).item()
+        return text_encoder1_cache, text_encoder2_cache
     tokenizer1, tokenizer2 = tokenizers
     text_encoder1, text_encoder2 = text_encoders
     text_encoder1.to(accelerator.device)
@@ -399,6 +482,8 @@ def cache_text_encoder_outputs(args, accelerator, tokenizers, text_encoders, dat
             pool2 = pool2.detach().to("cpu").squeeze(0)  # 1280
             text_encoder1_cache[input_id1_cache_key] = encoder_hidden_states1
             text_encoder2_cache[input_id2_cache_key] = (encoder_hidden_states2, pool2)
+    np.save(os.path.join(text_encoder_cache_dir, "text_enc1.npy"), text_encoder1_cache)
+    np.save(os.path.join(text_encoder_cache_dir, "text_enc2.npy"), text_encoder2_cache)
     return text_encoder1_cache, text_encoder2_cache
 
 

@@ -438,7 +438,6 @@ class NetworkTrainer:
             args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
         # 学習する
-        # TODO: find a way to handle total batch size when there are multiple datasets
         total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
         accelerator.print("running training / 学習開始")
@@ -502,7 +501,6 @@ class NetworkTrainer:
 
         if use_user_config:
             # save metadata of multiple datasets
-            # NOTE: pack "ss_datasets" value as json one time
             #   or should also pack nested collections as json?
             datasets_metadata = []
             tag_frequency = {}  # merge tag frequency for metadata editor

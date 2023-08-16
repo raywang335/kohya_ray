@@ -38,6 +38,8 @@ from .train_util import (
   FineTuningDataset,
   ControlNetDataset,
   DatasetGroup,
+  T2IAdapterSubset,
+  T2IAdapterDataset,
 )
 
 
@@ -73,6 +75,11 @@ class FineTuningSubsetParams(BaseSubsetParams):
   metadata_file: Optional[str] = None
 
 @dataclass
+class T2IAdapterSubsetParams(BaseSubsetParams):
+  metadata_file: Optional[str] = None
+  lineart_dir: Optional[str] = None
+
+@dataclass
 class ControlNetSubsetParams(BaseSubsetParams):
   conditioning_data_dir: str = None
   caption_extension: str = ".caption"
@@ -104,6 +111,15 @@ class FineTuningDatasetParams(BaseDatasetParams):
   bucket_no_upscale: bool = False
 
 @dataclass
+class T2IAdapterDatasetParams(BaseDatasetParams):
+  batch_size: int = 1
+  enable_bucket: bool = False
+  min_bucket_reso: int = 256
+  max_bucket_reso: int = 1024
+  bucket_reso_steps: int = 64
+  bucket_no_upscale: bool = False
+
+@dataclass
 class ControlNetDatasetParams(BaseDatasetParams):
   batch_size: int = 1
   enable_bucket: bool = False
@@ -120,6 +136,7 @@ class SubsetBlueprint:
 class DatasetBlueprint:
   is_dreambooth: bool
   is_controlnet: bool
+  is_adapter: bool
   params: Union[DreamBoothDatasetParams, FineTuningDatasetParams]
   subsets: Sequence[SubsetBlueprint]
 
@@ -180,6 +197,11 @@ class ConfigSanitizer:
     Required("metadata_file"): str,
     "image_dir": str,
   }
+  T2I_SUBSET_DISTINCT_SCHEMA = {
+    Required("metadata_file"): str,
+    Required("lineart_dir"): str,
+    "image_dir": str,
+  }
   CN_SUBSET_ASCENDABLE_SCHEMA = {
     "caption_extension": str,
   }
@@ -216,7 +238,7 @@ class ConfigSanitizer:
     "dataset_repeats": "num_repeats",
   }
 
-  def __init__(self, support_dreambooth: bool, support_finetuning: bool, support_controlnet: bool, support_dropout: bool) -> None:
+  def __init__(self, support_dreambooth: bool, support_finetuning: bool, support_controlnet: bool, support_dropout: bool, support_adapter: bool) -> None:
     assert support_dreambooth or support_finetuning or support_controlnet, "Neither DreamBooth mode nor fine tuning mode specified. Please specify one mode or more. / DreamBooth モードか fine tuning モードのどちらも指定されていません。1つ以上指定してください。"
 
     self.db_subset_schema = self.__merge_dict(
@@ -229,6 +251,11 @@ class ConfigSanitizer:
     self.ft_subset_schema = self.__merge_dict(
       self.SUBSET_ASCENDABLE_SCHEMA,
       self.FT_SUBSET_DISTINCT_SCHEMA,
+      self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
+    )
+    self.t2i_subset_schema = self.__merge_dict(
+      self.SUBSET_ASCENDABLE_SCHEMA,
+      self.T2I_SUBSET_DISTINCT_SCHEMA,
       self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
     )
 
@@ -254,6 +281,13 @@ class ConfigSanitizer:
       {"subsets": [self.ft_subset_schema]},
     )
 
+    self.t2i_dataset_schema = self.__merge_dict(
+      self.DATASET_ASCENDABLE_SCHEMA,
+      self.SUBSET_ASCENDABLE_SCHEMA,
+      self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
+      {"subsets": [self.t2i_subset_schema]},
+    )
+
     self.cn_dataset_schema = self.__merge_dict(
       self.DATASET_ASCENDABLE_SCHEMA,
       self.SUBSET_ASCENDABLE_SCHEMA,
@@ -270,8 +304,11 @@ class ConfigSanitizer:
           return Schema(self.cn_dataset_schema)(dataset_config)
         # check dataset meets FT style
         # NOTE: all FT subsets should have "metadata_file"
+        elif all(['lineart_dir' in subset for subset in subsets_config]):
+          return Schema(self.t2i_dataset_schema)(dataset_config)
         elif all(["metadata_file" in subset for subset in subsets_config]):
           return Schema(self.ft_dataset_schema)(dataset_config)
+
         # check dataset meets DB style
         # NOTE: all DB subsets should have no "metadata_file"
         elif all(["metadata_file" not in subset for subset in subsets_config]):
@@ -286,6 +323,8 @@ class ConfigSanitizer:
       self.dataset_schema = self.ft_dataset_schema
     elif support_controlnet:
       self.dataset_schema = self.cn_dataset_schema
+    elif support_adapter:
+      self.dataset_schema = self.t2i_dataset_schema
 
     self.general_schema = self.__merge_dict(
       self.DATASET_ASCENDABLE_SCHEMA,
@@ -323,7 +362,6 @@ class ConfigSanitizer:
     try:
       return self.argparse_config_validator(argparse_namespace)
     except MultipleInvalid:
-      # XXX: this should be a bug
       print("Invalid cmdline parsed arguments. This should be a bug. / コマンドラインのパース結果が正しくないようです。プログラムのバグの可能性が高いです。")
       raise
 
@@ -351,7 +389,6 @@ class BlueprintGenerator:
     sanitized_argparse_namespace = self.sanitizer.sanitize_argparse_namespace(argparse_namespace)
 
     # convert argparse namespace to dict like config
-    # NOTE: it is ok to have extra entries in dict
     optname_map = self.sanitizer.ARGPARSE_OPTNAME_TO_CONFIG_OPTNAME
     argparse_config = {optname_map.get(optname, optname): value for optname, value in vars(sanitized_argparse_namespace).items()}
 
@@ -359,20 +396,22 @@ class BlueprintGenerator:
 
     dataset_blueprints = []
     for dataset_config in sanitized_user_config.get("datasets", []):
-      # NOTE: if subsets have no "metadata_file", these are DreamBooth datasets/subsets
       subsets = dataset_config.get("subsets", [])
       is_dreambooth = all(["metadata_file" not in subset for subset in subsets])
       is_controlnet = all(["conditioning_data_dir" in subset for subset in subsets])
+      is_adapter = all(["lineart_dir" in subset for subset in subsets])
       if is_controlnet:
         subset_params_klass = ControlNetSubsetParams
         dataset_params_klass = ControlNetDatasetParams
       elif is_dreambooth:
         subset_params_klass = DreamBoothSubsetParams
         dataset_params_klass = DreamBoothDatasetParams
+      elif is_adapter:
+        subset_params_klass = T2IAdapterSubsetParams
+        dataset_params_klass = T2IAdapterDatasetParams
       else:
         subset_params_klass = FineTuningSubsetParams
         dataset_params_klass = FineTuningDatasetParams
-
       subset_blueprints = []
       for subset_config in subsets:
         params = self.generate_params_by_fallbacks(subset_params_klass,
@@ -381,7 +420,7 @@ class BlueprintGenerator:
 
       params = self.generate_params_by_fallbacks(dataset_params_klass,
                                                  [dataset_config, general_config, argparse_config, runtime_params])
-      dataset_blueprints.append(DatasetBlueprint(is_dreambooth, is_controlnet, params, subset_blueprints))
+      dataset_blueprints.append(DatasetBlueprint(is_dreambooth, is_controlnet, is_adapter, params, subset_blueprints))
 
     dataset_group_blueprint = DatasetGroupBlueprint(dataset_blueprints)
 
@@ -409,7 +448,7 @@ class BlueprintGenerator:
 
 
 def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlueprint):
-  datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
+  datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset, T2IAdapterDataset]] = []
 
   for dataset_blueprint in dataset_group_blueprint.datasets:
     if dataset_blueprint.is_controlnet:
@@ -418,6 +457,9 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
     elif dataset_blueprint.is_dreambooth:
       subset_klass = DreamBoothSubset
       dataset_klass = DreamBoothDataset
+    elif dataset_blueprint.is_adapter:
+      subset_klass = T2IAdapterSubset
+      dataset_klass = T2IAdapterDataset
     else:
       subset_klass = FineTuningSubset
       dataset_klass = FineTuningDataset
@@ -586,6 +628,7 @@ if __name__ == "__main__":
   parser.add_argument("--support_finetuning", action="store_true")
   parser.add_argument("--support_controlnet", action="store_true")
   parser.add_argument("--support_dropout", action="store_true")
+  parser.add_argument("--support_adapter", action="store_true")
   parser.add_argument("dataset_config")
   config_args, remain = parser.parse_known_args()
 
@@ -603,7 +646,7 @@ if __name__ == "__main__":
   print("\n[user_config]")
   print(user_config)
 
-  sanitizer = ConfigSanitizer(config_args.support_dreambooth, config_args.support_finetuning, config_args.support_controlnet, config_args.support_dropout)
+  sanitizer = ConfigSanitizer(config_args.support_dreambooth, config_args.support_finetuning, config_args.support_controlnet, config_args.support_dropout, config_args.support_adapter)
   sanitized_user_config = sanitizer.sanitize_user_config(user_config)
 
   print("\n[sanitized_user_config]")

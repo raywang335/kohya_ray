@@ -16,7 +16,7 @@
         num_head_channels: 64
         use_spatial_transformer: True
         use_linear_in_transformer: True
-        transformer_depth: [1, 2, 10]  # note: the first is unused (due to attn_res starting at 2) 32, 16, 8 --> 64, 32, 16
+        transformer_depth: [1, 2, 10]  # the first is unused (due to attn_res starting at 2) 32, 16, 8 --> 64, 32, 16
         context_dim: 2048
         spatial_transformer_attn_type: softmax-xformers
         legacy: False
@@ -461,7 +461,6 @@ class CrossAttention(nn.Module):
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
 
-    # TODO support Hypernetworks
     def forward_memory_efficient_xformers(self, x, context=None, mask=None):
         import xformers.ops
 
@@ -1060,7 +1059,7 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     # endregion
 
-    def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None, adapter_features=None, **kwargs):
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])
 
@@ -1086,13 +1085,55 @@ class SdxlUNet2DConditionModel(nn.Module):
                     x = layer(x)
             return x
 
+        def call_mid_module(module, h, emb, context, adapter_feature=None):
+            assert adapter_feature is not None, "adapter_features is None" 
+            x = h
+            for i, layer in enumerate(module):
+                if i == 0:
+                    if isinstance(layer, ResnetBlock2D):
+                        x = layer(x, emb)
+                    elif isinstance(layer, Transformer2DModel):
+                        x = layer(x, context)
+                    else:
+                        x = layer(x)
+                    x = x + adapter_feature
+                else:
+                    if isinstance(layer, ResnetBlock2D):
+                        x = layer(x, emb)
+                    elif isinstance(layer, Transformer2DModel):
+                        x = layer(x, context)
+                    else:
+                        x = layer(x)
+            return x
+                
+
+
         # h = x.type(self.dtype)
         h = x
-        for module in self.input_blocks:
-            h = call_module(module, h, emb, context)
+        for i, module in enumerate(self.input_blocks):
+            if i == 3 and adapter_features is not None and len(adapter_features) > 0:
+                h = call_module(module, h, emb, context)
+                adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[2,3], keepdim=True)) \
+                                        / torch.std(adapter_features[0], dim=[2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
+                h = h + adapter_features.pop(0)
+            elif i == 5 and adapter_features is not None and len(adapter_features) > 0:
+                h = call_module(module, h, emb, context)
+                adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[1,2,3], keepdim=True)) \
+                                        / torch.std(adapter_features[0], dim=[1,2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
+                h = h + adapter_features.pop(0)
+            # if isinstance(module[0], Downsample2D) and adapter_features is not None:
+            #     h = h + adapter_features.pop(0)
+            elif i == 8 and adapter_features is not None and len(adapter_features) > 0:
+                h = call_module(module, h, emb, context)
+                adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[2,3], keepdim=True)) \
+                                        / torch.std(adapter_features[0], dim=[2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
+                h = h + adapter_features.pop(0)
+            else:
+                h = call_module(module, h, emb, context)
             hs.append(h)
+        assert adapter_features is None or len(adapter_features) == 0, "Something wrong!!!"
 
-        h = call_module(self.middle_block, h, emb, context)
+        h = call_module(self.middle_block, h, emb, context) #if adapter_features is None or len(adapter_features) == 0 else call_mid_module(self.middle_block, h, emb, context, adapter_features.pop(0))
 
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
@@ -1106,11 +1147,11 @@ class SdxlUNet2DConditionModel(nn.Module):
 
 if __name__ == "__main__":
     import time
-
+    device = 'cuda:3'
     print("create unet")
     unet = SdxlUNet2DConditionModel()
 
-    unet.to("cuda")
+    unet.to(device)
     unet.set_use_memory_efficient_attention(True, False)
     unet.set_gradient_checkpointing(True)
     unet.train()
@@ -1123,11 +1164,12 @@ if __name__ == "__main__":
     # import bitsandbytes
     # optimizer = bitsandbytes.adam.Adam8bit(unet.parameters(), lr=1e-3)        # not working
     # optimizer = bitsandbytes.optim.RMSprop8bit(unet.parameters(), lr=1e-3)  # working at 23.5 GB with torch2
-    # optimizer=bitsandbytes.optim.Adagrad8bit(unet.parameters(), lr=1e-3)  # working at 23.5 GB with torch2
+    # optimizer= bitsandbytes.optim.Adagrad8bit(unet.parameters(), lr=1e-3)  # working at 23.5 GB with torch2
 
     import transformers
 
-    optimizer = transformers.optimization.Adafactor(unet.parameters(), relative_step=True)  # working at 22.2GB with torch2
+    # optimizer = transformers.optimization.Adafactor(unet.parameters(), relative_step=True)  # working at 22.2GB with torch2
+    optimizer = transformers.optimization.AdamW(unet.parameters())  # working at 41.7GB with torch2
 
     scaler = torch.cuda.amp.GradScaler(enabled=True)
 
@@ -1140,10 +1182,10 @@ if __name__ == "__main__":
         if step == 1:
             time_start = time.perf_counter()
 
-        x = torch.randn(batch_size, 4, 128, 128).cuda()  # 1024x1024
-        t = torch.randint(low=0, high=10, size=(batch_size,), device="cuda")
-        ctx = torch.randn(batch_size, 77, 2048).cuda()
-        y = torch.randn(batch_size, ADM_IN_CHANNELS).cuda()
+        x = torch.randn(batch_size, 4, 128, 128).to(device)  # 1024x1024
+        t = torch.randint(low=0, high=10, size=(batch_size,), device=device)
+        ctx = torch.randn(batch_size, 77, 2048).to(device)
+        y = torch.randn(batch_size, ADM_IN_CHANNELS).to(device)
 
         with torch.cuda.amp.autocast(enabled=True):
             output = unet(x, t, ctx, y)

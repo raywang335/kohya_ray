@@ -72,5 +72,9 @@ if __name__ == '__main__':
   # スペルミスしていたオプションを復元する
   if args.caption_extention is not None:
     args.caption_extension = args.caption_extention
-
-  main(args)
+  ori_file_dir = args.train_data_dir
+  for i in range(200):
+      args.in_json = args.out_json if i > 0 else None
+      args.train_data_dir = os.path.join(ori_file_dir, str(i).zfill(5))
+      print(f'args.IMG_DIR: {args.train_data_dir}')
+      main(args)

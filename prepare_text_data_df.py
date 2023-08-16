@@ -10,6 +10,8 @@ from PIL import Image
 import cv2
 import torch
 from torchvision import transforms
+import library.sdxl_train_util as sdxl_train_util
+import library.sdxl_model_util as sdxl_model_util
 
 import library.model_util as model_util
 import library.train_util as train_util
@@ -34,7 +36,7 @@ def collate_fn_remove_corrupted(batch):
     return batch
 
 
-def get_latents(vae, key_and_images, weight_dtype):
+def get_latents(vae, key_and_images, tokenizers, text_encoders, weight_dtype=torch.float32, cache_dir=None):
     img_tensors = [IMAGE_TRANSFORMS(image) for _, image in key_and_images]
     img_tensors = torch.stack(img_tensors)
     img_tensors = img_tensors.to(DEVICE, weight_dtype)
@@ -45,13 +47,38 @@ def get_latents(vae, key_and_images, weight_dtype):
     for (key, _), latents1 in zip(key_and_images, latents):
         if torch.isnan(latents1).any():
             raise ValueError(f"NaN detected in latents of {key}")
+    text_latents_hid_1 = []
+    text_latents_hid_2 = []
+    text_latents_hid_pool2 = []
+    for key, image in key_and_images:
+        caption = open(os.path.splitext(key)[0]+".txt", "r", encoding="utf-8").read().strip()
+        input_id1 = get_input_ids(caption, tokenizers[0]).to(DEVICE)
+        input_id2 = get_input_ids(caption, tokenizers[1]).to(DEVICE)
+        with torch.no_grad():
+            encoder_hidden_states1, encoder_hidden_states2, pool2 = sdxl_train_util.get_hidden_states(
+                args,
+                input_id1,
+                input_id2,
+                tokenizers[0],
+                tokenizers[1],
+                text_encoders[0],
+                text_encoders[1],
+                torch.float16,
+            )
+            encoder_hidden_states1 = encoder_hidden_states1.detach().to("cpu").squeeze(0)  # n*75+2,768
+            encoder_hidden_states2 = encoder_hidden_states2.detach().to("cpu").squeeze(0)  # n*75+2,1280
+            pool2 = pool2.detach().to("cpu").squeeze(0)  # 1280
+            text_latents_hid_1.append(encoder_hidden_states1)
+            text_latents_hid_2.append(encoder_hidden_states2)
+            text_latents_hid_pool2.append(pool2)
+    return latents, text_latents_hid_1, text_latents_hid_2, text_latents_hid_pool2
 
-    return latents
 
 
-def get_npz_filename_wo_ext(data_dir, image_key, is_full_path, flip, recursive):
+def get_npz_filename_wo_ext(data_dir, image_key, is_full_path, flip, recursive, is_text=False):
     if is_full_path:
-        base_name = os.path.splitext(os.path.basename(image_key))[0]
+        base_name = os.path.splitext(os.path.basename(image_key))[0] if not is_text else os.path.splitext(os.path.basename(image_key))[0]+"_text"
+
         relative_path = os.path.relpath(os.path.dirname(image_key), data_dir)
     else:
         base_name = image_key
@@ -66,19 +93,28 @@ def get_npz_filename_wo_ext(data_dir, image_key, is_full_path, flip, recursive):
         return os.path.join(data_dir, base_name)
 
 
+def get_input_ids(caption, tokenizer):
+    input_ids = tokenizer(
+        caption, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt"
+    ).input_ids
+    return input_ids
+
+
+
 def main(args):
     # assert args.bucket_reso_steps % 8 == 0, f"bucket_reso_steps must be divisible by 8 / bucket_reso_stepは8で割り切れる必要があります"
     if args.bucket_reso_steps % 8 > 0:
         print(f"resolution of buckets in training time is a multiple of 8 / 学習時の各bucketの解像度は8単位になります")
-
-    train_data_dir_path = Path(args.train_data_dir)
-    image_paths: List[str] = [str(p) for p in train_util.glob_images_pathlib(train_data_dir_path, args.recursive)]
-    print(f"found {len(image_paths)} images.")
+    # image_paths = open(args.image_list, 'r').readlines()
+    # image_paths = [path.strip() for path in image_paths if os.path.exists(path.strip())]
 
     if os.path.exists(args.in_json):
         print(f"loading existing metadata: {args.in_json}")
         with open(args.in_json, "rt", encoding="utf-8") as f:
             metadata = json.load(f)
+        image_paths: List[str] = [str(p.strip()) for p in metadata.keys()]
+        print(f"found {len(image_paths)} images.")
+
     else:
         print(f"no metadata / メタデータファイルがありません: {args.in_json}")
         return
@@ -89,9 +125,51 @@ def main(args):
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
+    # vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
+    # vae.eval()
+    # vae.to(DEVICE, dtype=weight_dtype)
+    (text_encoder1, text_encoder2, vae, _, logit_scale, ckpt_info) = sdxl_model_util.load_models_from_sdxl_checkpoint("sdxl", args.model_name_or_path, 'cpu', need_unet=False)
+    text_encoder1.to(DEVICE)
+    text_encoder2.to(DEVICE)
+    vae.to(DEVICE)
     vae.eval()
-    vae.to(DEVICE, dtype=weight_dtype)
+    text_encoder1.eval()
+    text_encoder2.eval()
+    args.tokenizer_cache_dir = None
+    args.max_token_length = None
+    tokenizer1, tokenizer2 = sdxl_train_util.load_tokenizers(args)
+    tokenizers = [tokenizer1, tokenizer2]
+    text_encoders = [text_encoder1, text_encoder2]
+
+    if args.null_token:
+        caption = ""
+        input_id1 = get_input_ids(caption, tokenizers[0]).to(DEVICE)
+        input_id2 = get_input_ids(caption, tokenizers[1]).to(DEVICE)
+
+        with torch.no_grad():
+            encoder_hidden_states1, encoder_hidden_states2, pool2 = sdxl_train_util.get_hidden_states(
+                args,
+                input_id1,
+                input_id2,
+                tokenizers[0],
+                tokenizers[1],
+                text_encoders[0],
+                text_encoders[1],
+                torch.float16,
+            )
+            encoder_hidden_states1 = encoder_hidden_states1.detach().to("cpu").squeeze(0)  # n*75+2,768
+            encoder_hidden_states2 = encoder_hidden_states2.detach().to("cpu").squeeze(0)  # n*75+2,1280
+            pool2 = pool2.detach().to("cpu").squeeze(0)  # 1280
+            text_latent = {
+                        'hid1': encoder_hidden_states1.cpu().numpy(),
+                        'hid2': encoder_hidden_states2.cpu().numpy(),
+                        'pool': pool2.cpu().numpy(),
+                    }
+        npz_file_name = os.path.join(os.path.dirname(args.train_data_dir), 'null_token.npy')
+        np.save(npz_file_name, text_latent)
+        print(f"saved null token latent to {npz_file_name}")
+        return
+            
 
     # bucketのサイズを計算する
     max_reso = tuple([int(t) for t in args.max_resolution.split(",")])
@@ -113,35 +191,41 @@ def main(args):
     def process_batch(is_last):
         for bucket in bucket_manager.buckets:
             if (is_last and len(bucket) > 0) or len(bucket) >= args.batch_size:
-                latents = get_latents(vae, [(key, img) for key, img, _, _ in bucket], weight_dtype)
+                latents, hid1s, hid2s, pools = get_latents(vae, [(key, img) for key, img, _, _ in bucket], tokenizers, text_encoders, weight_dtype, cache_dir=args.cache_dir)
                 assert (
                     latents.shape[2] == bucket[0][1].shape[0] // 8 and latents.shape[3] == bucket[0][1].shape[1] // 8
                 ), f"latent shape {latents.shape}, {bucket[0][1].shape}"
 
-                for (image_key, _, original_size, crop_left_top), latent in zip(bucket, latents):
-                    npz_file_name = get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, False, args.recursive)
+                for (image_key, _, original_size, crop_left_top), latent, hid1, hid2, pool in zip(bucket, latents, hid1s, hid2s, pools):
+                    npz_file_name = get_npz_filename_wo_ext(args.cache_dir, image_key, args.full_path, False, False)
                     train_util.save_latents_to_disk(npz_file_name, latent, original_size, crop_left_top)
+                    text_latent = {
+                        'hid1': hid1.cpu().numpy(),
+                        'hid2': hid2.cpu().numpy(),
+                        'pool': pool.cpu().numpy(),
+                    }
+                    npz_file_name = get_npz_filename_wo_ext(args.cache_dir, image_key, args.full_path, False, False, is_text=True)
+                    np.save(npz_file_name, text_latent)
+                # # flip
+                # if args.flip_aug:
+                #     latents = get_latents(
+                #         vae, [(key, img[:, ::-1].copy()) for key, img, _, _ in bucket], weight_dtype
+                #     )  # copyがないとTensor変換できない
 
-                # flip
-                if args.flip_aug:
-                    latents = get_latents(
-                        vae, [(key, img[:, ::-1].copy()) for key, img, _, _ in bucket], weight_dtype
-                    )  # copyがないとTensor変換できない
-
-                    for (image_key, _, original_size, crop_left_top), latent in zip(bucket, latents):
-                        npz_file_name = get_npz_filename_wo_ext(
-                            args.train_data_dir, image_key, args.full_path, True, args.recursive
-                        )
-                        train_util.save_latents_to_disk(npz_file_name, latent, original_size, crop_left_top)
-                else:
-                    # remove existing flipped npz
-                    for image_key, _ in bucket:
-                        npz_file_name = (
-                            get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, True, args.recursive) + ".npz"
-                        )
-                        if os.path.isfile(npz_file_name):
-                            print(f"remove existing flipped npz / 既存のflipされたnpzファイルを削除します: {npz_file_name}")
-                            os.remove(npz_file_name)
+                #     for (image_key, _, original_size, crop_left_top), latent in zip(bucket, latents):
+                #         npz_file_name = get_npz_filename_wo_ext(
+                #             args.train_data_dir, image_key, args.full_path, True, args.recursive
+                #         )
+                #         train_util.save_latents_to_disk(npz_file_name, latent, original_size, crop_left_top)
+                # else:
+                #     # remove existing flipped npz
+                #     for image_key, _ in bucket:
+                #         npz_file_name = (
+                #             get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, True, args.recursive) + ".npz"
+                #         )
+                #         if os.path.isfile(npz_file_name):
+                #             print(f"remove existing flipped npz / 既存のflipされたnpzファイルを削除します: {npz_file_name}")
+                #             os.remove(npz_file_name)
 
                 bucket.clear()
 
@@ -176,7 +260,7 @@ def main(args):
                 print(f"Could not load image path / 画像を読み込めません: {image_path}, error: {e}")
                 continue
 
-        image_key = image_path if args.full_path else os.path.splitext(os.path.basename(image_path))[0]
+        image_key = image_path if args.full_path else f'{os.path.basename(os.path.dirname(image_path))}xyz{os.path.splitext(os.path.basename(image_path))[0]}'
         if image_key not in metadata:
             metadata[image_key] = {}
 
@@ -188,7 +272,10 @@ def main(args):
 
         # メタデータに記録する解像度はlatent単位とするので、8単位で切り捨て
         metadata[image_key]["train_resolution"] = (reso[0] - reso[0] % 8, reso[1] - reso[1] % 8)
-
+        metadata[image_key]["npz_path"] = f'{args.cache_dir}/{os.path.splitext(os.path.basename(image_path))[0]}.npz'
+        metadata[image_key]['text_latent'] = f'{args.cache_dir}/{os.path.splitext(os.path.basename(image_path))[0]}_text.npy'
+        # del metadata[image_key]['caption']
+        
         if not args.bucket_no_upscale:
             # upscaleを行わないときには、resize後のサイズは、bucketのサイズと、縦横どちらかが同じであることを確認する
             assert (
@@ -204,10 +291,10 @@ def main(args):
 
         # 既に存在するファイルがあればshape等を確認して同じならskipする
         if args.skip_existing:
-            npz_files = [get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, False, args.recursive) + ".npz"]
+            npz_files = [get_npz_filename_wo_ext(args.cache_dir, image_key, args.full_path, False, args.recursive) + ".npz"]
             if args.flip_aug:
                 npz_files.append(
-                    get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, True, args.recursive) + ".npz"
+                    get_npz_filename_wo_ext(args.cache_dir, image_key, args.full_path, True, False, is_text=True) + ".npz"
                 )
 
             found = True
@@ -229,7 +316,13 @@ def main(args):
 
         # 画像をリサイズしてトリミングする
         # PILにinter_areaがないのでcv2で……
-        image = np.array(image)
+        try:
+            image = np.array(image)
+        except OSError as e:
+            print("image is corrupted, skipping / 画像が壊れているのでスキップします: ", image_path)
+            del metadata[image_key] 
+            continue
+        
         if resized_size[0] != image.shape[1] or resized_size[1] != image.shape[0]:  # リサイズ処理が必要？
             image = cv2.resize(image, resized_size, interpolation=cv2.INTER_AREA)
 
@@ -255,7 +348,6 @@ def main(args):
 
         # # debug
         # cv2.imwrite(f"r:\\test\\img_{len(img_ar_errors)}.jpg", image[:, :, ::-1])
-
         # バッチへ追加
         bucket_manager.add_image(reso, (image_key, image, original_size_wh, crop_left_top))
 
@@ -331,6 +423,18 @@ def setup_parser() -> argparse.ArgumentParser:
         "--recursive",
         action="store_true",
         help="recursively look for training tags in all child folders of train_data_dir / train_data_dirのすべての子フォルダにある学習タグを再帰的に探す",
+    )
+    parser.add_argument(
+        "--image_list",
+        type=str
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str
+    )
+    parser.add_argument(
+        "--null_token",
+        action="store_true",
     )
 
     return parser

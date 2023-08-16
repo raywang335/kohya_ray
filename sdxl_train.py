@@ -219,7 +219,7 @@ def train(args):
         if args.cache_text_encoder_outputs:
             # Text Encodes are eval and no grad
             text_encoder1_cache, text_encoder2_cache = sdxl_train_util.cache_text_encoder_outputs(
-                args, accelerator, (tokenizer1, tokenizer2), (text_encoder1, text_encoder2), train_dataset_group, None
+                args, accelerator, (tokenizer1, tokenizer2), (text_encoder1, text_encoder2), train_dataset_group, None, args.text_encoder_cache_dir
             )
             accelerator.wait_for_everyone()
 
@@ -618,6 +618,11 @@ def setup_parser() -> argparse.ArgumentParser:
         "--no_half_vae",
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
+    )
+    parser.add_argument(
+        "--text_encoder_cache_dir",
+        type=str,
+        default=None,
     )
 
     return parser

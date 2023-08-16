@@ -1534,6 +1534,8 @@ class UNet2DConditionModel(nn.Module):
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
 
             down_block_res_samples += res_samples
+        for i in range(len(down_block_res_samples)):
+            print(f'down_block_res_samples[{i}]: {down_block_res_samples[i].shape}')
 
         # skip connectionにControlNetの出力を追加する
         if down_block_additional_residuals is not None:
