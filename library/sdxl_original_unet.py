@@ -1059,7 +1059,7 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     # endregion
 
-    def forward(self, x, timesteps=None, context=None, y=None, adapter_features=None, **kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None, adapter_features=None, weight=0., **kwargs):
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])
 
@@ -1113,21 +1113,30 @@ class SdxlUNet2DConditionModel(nn.Module):
         for i, module in enumerate(self.input_blocks):
             if i == 3 and adapter_features is not None and len(adapter_features) > 0:
                 h = call_module(module, h, emb, context)
-                adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[2,3], keepdim=True)) \
-                                        / torch.std(adapter_features[0], dim=[2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
-                h = h + adapter_features.pop(0)
+                # adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[2,3], keepdim=True)) \
+                #                         / torch.std(adapter_features[0], dim=[2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
+                # h = h + adapter_features.pop(0) 
+                
+                gamma, eta = torch.chunk(adapter_features.pop(0), 2, dim=1)
+                h = (1 + gamma) * (h - torch.mean(h, dim=[2,3], keepdim=True)) / torch.std(h, dim=[2,3], keepdim=True) + eta
+                # h = h + delta_h
             elif i == 5 and adapter_features is not None and len(adapter_features) > 0:
                 h = call_module(module, h, emb, context)
-                adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[1,2,3], keepdim=True)) \
-                                        / torch.std(adapter_features[0], dim=[1,2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
-                h = h + adapter_features.pop(0)
-            # if isinstance(module[0], Downsample2D) and adapter_features is not None:
-            #     h = h + adapter_features.pop(0)
+                # adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[1,2,3], keepdim=True)) \
+                #                         / torch.std(adapter_features[0], dim=[1,2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
+                # h = h + adapter_features.pop(0) 
+                gamma, eta = torch.chunk(adapter_features.pop(0), 2, dim=1)
+                h = (1 + gamma) * (h - torch.mean(h, dim=[2,3], keepdim=True)) / torch.std(h, dim=[2,3], keepdim=True) + eta
+                # h = h + delta_h
             elif i == 8 and adapter_features is not None and len(adapter_features) > 0:
                 h = call_module(module, h, emb, context)
-                adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[2,3], keepdim=True)) \
-                                        / torch.std(adapter_features[0], dim=[2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
-                h = h + adapter_features.pop(0)
+                # adapter_features[0] = torch.std(h, dim=[1,2,3], keepdim=True) * (adapter_features[0] - torch.mean(adapter_features[0], dim=[2,3], keepdim=True)) \
+                #                         / torch.std(adapter_features[0], dim=[2,3], keepdim=True) + torch.mean(h, dim=[1,2,3], keepdim=True)
+                # h = h + adapter_features.pop(0) 
+                # h = (1 - weight) * h + (1 + weight) * adapter_features.pop(0)
+                gamma, eta = torch.chunk(adapter_features.pop(0), 2, dim=1)
+                h = (1 + gamma) * (h - torch.mean(h, dim=[2,3], keepdim=True)) / torch.std(h, dim=[2,3], keepdim=True) + eta
+                # h = h + delta_h
             else:
                 h = call_module(module, h, emb, context)
             hs.append(h)

@@ -309,7 +309,7 @@ if __name__ == "__main__":
                 latent_model_input = scheduler.scale_model_input(latent_model_input, t)
                 # adapter_features = [10*i.repeat(num_latent_input, 1, 1, 1).clone().to(DEVICE, dtype=DTYPE) for i in lineart_cond]
                 adapter_features = sd_adapter(lineart_img, inference=True)
-                noise_pred = unet(latent_model_input, t, text_embeddings, vector_embeddings, adapter_features=adapter_features)
+                noise_pred = unet(latent_model_input, t, text_embeddings, vector_embeddings, adapter_features=adapter_features, weight=0.25)
 
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(num_latent_input)  # uncond by negative prompt
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)

@@ -3542,9 +3542,15 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
         for arg in args.lr_scheduler_args:
-            key, value = arg.split("=")
+            sub_key_val_pair = arg.split(" ")
+            for sub_key_val in sub_key_val_pair:
+                key, value = sub_key_val.split("=")
+                value = ast.literal_eval(value)
+                lr_scheduler_kwargs[key] = value
 
-            value = ast.literal_eval(value)
+            # key, value = arg.split("=")
+
+            # value = ast.literal_eval(value)
             # value = value.split(",")
             # for i in range(len(value)):
             #     if value[i].lower() == "true" or value[i].lower() == "false":
@@ -3555,8 +3561,8 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             #     value = value[0]
             # else:
             #     value = list(value)  # some may use list?
+            # lr_scheduler_kwargs[key] = value
 
-            lr_scheduler_kwargs[key] = value
 
     def wrap_check_needless_num_warmup_steps(return_vals):
         if num_warmup_steps is not None and num_warmup_steps != 0:
@@ -3606,7 +3612,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, num_cycles=num_cycles
         )
 
-    if name == SchedulerType.POLYNOMIAL:
+    if name == SchedulerType.POLYNOMIAL: #polynomial
         return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power)
 
     return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)

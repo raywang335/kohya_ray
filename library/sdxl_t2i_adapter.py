@@ -92,12 +92,12 @@ class SdxlT2IAdapter(nn.Module):
             for j in range(nums_rb):
                 if (i != 0) and (j == 0):
                     self.body.append(
-                        ResnetBlock(channels[i - 1], channels[i], down=is_down[i*nums_rb+j], ksize=ksize, sk=sk, use_conv=use_conv))
+                        ResnetBlock(channels[i - 1] * 2, channels[i] * 2, down=is_down[i*nums_rb+j], ksize=ksize, sk=sk, use_conv=use_conv))
                 else:
                     self.body.append(
-                        ResnetBlock(channels[i], channels[i], down=is_down[i*nums_rb+j], ksize=ksize, sk=sk, use_conv=use_conv))
+                        ResnetBlock(channels[i] * 2, channels[i] * 2, down=is_down[i*nums_rb+j], ksize=ksize, sk=sk, use_conv=use_conv))
         self.body = nn.ModuleList(self.body)
-        self.conv_in = nn.Conv2d(cin, channels[0], 3, 1, 1)
+        self.conv_in = nn.Conv2d(cin, channels[0] * 2, 3, 1, 1)
 
     def forward(self, x, inference=False):
         # unshuffle

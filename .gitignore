@@ -55,7 +55,6 @@ hires_cache_dir
 lineart_models
 samples_xl_finetune
 T2Iadapter_lineart
-*.sh
 prompts_file.txt
 prompts_list4test.txt
 *.jpg
